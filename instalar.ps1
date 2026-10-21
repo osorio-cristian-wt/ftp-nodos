@@ -8,7 +8,7 @@
     Token compartido de la red. Sin el, se genera uno (primer nodo) y se muestra
     al final para pasarselo a los demas nodos.
 .PARAMETER Nodo
-    Alias de nodos como NOMBRE=IP (ej. master=10.144.0.2 zephy=10.144.0.1).
+    Alias de nodos como NOMBRE=IP (ej. pc1=10.147.17.5 pc2=10.147.17.8).
 .PARAMETER Root
     Directorio que expone este nodo (default: el 'root' de la config, o el home).
 .PARAMETER RemoteAddress
@@ -16,9 +16,9 @@
 .PARAMETER Quitar
     Desinstala todo (la config con el token se conserva).
 .EXAMPLE
-    .\instalar.ps1 -Nodo master=10.144.0.2,zephy=10.144.0.1 -Root C:\repos
+    .\instalar.ps1 -Nodo pc1=10.147.17.5,pc2=10.147.17.8 -Root C:\repos
 .EXAMPLE
-    .\instalar.ps1 -Token 1ac7be7c4fe9aa7fe0bcdbd745e92bb9 -Nodo master=10.144.0.2,zephy=10.144.0.1 -Root C:\repos
+    .\instalar.ps1 -Token <token-del-primer-nodo> -Nodo pc1=10.147.17.5,pc2=10.147.17.8 -Root C:\repos
 .EXAMPLE
     .\instalar.ps1 -Quitar
 #>
@@ -96,7 +96,6 @@ if ($Token) { $initArgs += @("--token", $Token) }
 if ($Root)  { $initArgs += @("--root", $Root) }
 if ($Port)  { $initArgs += @("--port", $Port) }
 foreach ($n in $Nodo) { $initArgs += @("--node", $n) }
-$existia = Test-Path $config
 & $python $script @initArgs
 if ($LASTEXITCODE -ne 0) { throw "no se pudo escribir $config" }
 $cfg = Get-Content $config -Raw | ConvertFrom-Json
@@ -143,8 +142,8 @@ if ($escucha) {
     Write-Warning "El demonio no esta escuchando todavia. Revisa el log: $log"
 }
 Write-Host "Abri una terminal nueva y proba:  ztftp ls <nodo>:."
-if (-not $existia -and -not $Token) {
+if (-not $Token) {
     Write-Host ""
-    Write-Host "Token generado: $($cfg.token)" -ForegroundColor Yellow
+    Write-Host "Token de la red: $($cfg.token)" -ForegroundColor Yellow
     Write-Host "En los demas nodos corre:  .\instalar.ps1 -Token $($cfg.token) -Nodo <nombre>=<ip> ..."
 }
