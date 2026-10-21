@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ztftp"
+version = "0.2.0"
+description = "Transferencia de archivos liviana por CLI entre nodos de ZeroTier One"
+readme = "README.md"
+requires-python = ">=3.8"
+
+[project.scripts]
+ztftp = "ztftp:main"
+
+[tool.setuptools]
+py-modules = ["ztftp"]

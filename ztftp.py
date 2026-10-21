@@ -29,7 +29,7 @@ import time
 DEFAULT_PORT = 9777
 CHUNK = 1 << 20
 TIMEOUT = 30
-MAX_MSG = 1 << 20
+MAX_MSG = 64 << 20
 PART = ".ztftp-part"
 
 
@@ -151,33 +151,98 @@ def dest_path(dest, name):
     return dest
 
 
-def client_put(host, port, token, local, remote, cb=None):
-    size = os.path.getsize(local)
+def is_inside(root, full):
+    try:
+        return os.path.commonpath([os.path.normcase(root), os.path.normcase(full)]) \
+            == os.path.normcase(root)
+    except ValueError:  # otra unidad en Windows
+        return False
+
+
+def manifest(path):
+    """Describe un archivo o directorio a transferir (rutas relativas con /)."""
+    if os.path.isfile(path):
+        return {"name": os.path.basename(path), "isdir": False, "dirs": [],
+                "files": [["", os.path.getsize(path)]]}
+    if not os.path.isdir(path):
+        raise ZtError("no existe: " + path)
+    dirs, files = [], []
+    for cur, subdirs, names in os.walk(path):
+        subdirs.sort()
+        rel = os.path.relpath(cur, path).replace(os.sep, "/")
+        prefix = "" if rel == "." else rel + "/"
+        dirs += [prefix + d for d in subdirs]
+        files += [[prefix + n, os.path.getsize(os.path.join(cur, n))]
+                  for n in sorted(names)
+                  if not n.endswith(PART) and os.path.isfile(os.path.join(cur, n))]
+    return {"name": os.path.basename(os.path.abspath(path)) or "raiz",
+            "isdir": True, "dirs": dirs, "files": files}
+
+
+def tree_total(man):
+    return sum(size for _, size in man["files"])
+
+
+def tree_path(base, rel, root=None):
+    """base + rel (con /); no puede escapar de base ni, con root, de root."""
+    if not rel:
+        target = base
+    else:
+        base_abs = os.path.abspath(base)
+        target = os.path.abspath(os.path.join(base_abs, *rel.split("/")))
+        if target == base_abs or not is_inside(base_abs, target):
+            raise ZtError("ruta invalida en la transferencia: " + rel)
+    return resolve(root, target) if root else target
+
+
+def _tree_cb(cb, done, total):
+    return (lambda n, _t: cb(done + n, total)) if cb else None
+
+
+def send_tree(sock, base, man, cb=None, root=None):
+    total, done = tree_total(man), 0
+    for rel, size in man["files"]:
+        send_file(sock, tree_path(base, rel, root), size, _tree_cb(cb, done, total))
+        done += size
+
+
+def recv_tree(sock, base, man, cb=None, root=None):
+    total, done = tree_total(man), 0
+    os.makedirs(base if man["isdir"] else os.path.dirname(base), exist_ok=True)
+    for d in man["dirs"]:
+        os.makedirs(tree_path(base, d, root), exist_ok=True)
+    for rel, size in man["files"]:
+        target = tree_path(base, rel, root)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp = target + PART
+        try:
+            with open(tmp, "wb") as f:
+                ok = recv_file(sock, f, size, _tree_cb(cb, done, total))
+            if not ok:
+                raise ZtError("checksum no coincide en " + (rel or target))
+            os.replace(tmp, target)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        done += size
+
+
+def client_put(host, port, token, local, remote, cb=None, root=None):
+    man = manifest(local)
     with connect(host, port, token) as s:
-        send_msg(s, {"op": "put", "path": remote, "size": size,
-                     "name": os.path.basename(local)})
+        send_msg(s, dict(man, op="put", path=remote))
         recv_final(s)
-        send_file(s, local, size, cb)
+        send_tree(s, local, man, cb, root)
         return recv_final(s)
 
 
 def client_get(host, port, token, remote, local, cb=None):
     with connect(host, port, token) as s:
         send_msg(s, {"op": "get", "path": remote})
-        r = recv_final(s)
-        dest = dest_path(local, r["name"])
-        os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
-        tmp = dest + PART
-        try:
-            with open(tmp, "wb") as f:
-                ok = recv_file(s, f, r["size"], cb)
-            if not ok:
-                raise ZtError("checksum no coincide, transferencia corrupta")
-            os.replace(tmp, dest)
-        finally:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        return {"path": dest, "size": r["size"]}
+        man = recv_final(s)
+        dest = dest_path(local, man["name"])
+        recv_tree(s, dest, man, cb)
+        return {"path": dest, "size": tree_total(man), "files": len(man["files"])}
 
 
 def client_push(host, port, token, remote, dst_host, dst_port, dst_path, cb=None):
@@ -200,12 +265,7 @@ def resolve(root, p):
     """Resuelve p dentro de root; rechaza cualquier escape (.., symlinks)."""
     full = p if os.path.isabs(p) else os.path.join(root, p)
     full = os.path.realpath(full)
-    try:
-        inside = os.path.commonpath([os.path.normcase(root), os.path.normcase(full)]) \
-            == os.path.normcase(root)
-    except ValueError:
-        inside = False
-    if not inside:
+    if not is_inside(root, full):
         raise ZtError("ruta fuera de la raiz del nodo: " + p)
     return full
 
@@ -252,39 +312,27 @@ class Handler(socketserver.BaseRequestHandler):
         send_msg(s, {"ok": True, "path": full, "entries": entries})
 
     def op_get(self, s, req, who):
-        full = resolve(self.server.root, req["path"])
-        if not os.path.isfile(full):
-            raise ZtError("no es un archivo: " + req["path"])
-        size = os.path.getsize(full)
-        send_msg(s, {"ok": True, "size": size, "name": os.path.basename(full)})
-        log(f"{who}: GET {full} ({size} bytes)")
-        send_file(s, full, size)
+        root = self.server.root
+        full = resolve(root, req["path"] or ".")
+        man = manifest(full)
+        send_msg(s, dict(man, ok=True))
+        log(f"{who}: GET {full} ({len(man['files'])} archivos, {tree_total(man)} bytes)")
+        send_tree(s, full, man, root=root)
 
     def op_put(self, s, req, who):
+        root = self.server.root
         path = req["path"]
-        size = int(req["size"])
-        full = resolve(self.server.root, dest_path(
-            path if os.path.isabs(path) else os.path.join(self.server.root, path),
-            req["name"]))
-        os.makedirs(os.path.dirname(full), exist_ok=True)
+        base = resolve(root, dest_path(
+            path if os.path.isabs(path) else os.path.join(root, path), req["name"]))
         send_msg(s, {"ok": True})
-        tmp = full + PART
-        try:
-            with open(tmp, "wb") as f:
-                ok = recv_file(s, f, size)
-            if not ok:
-                raise ZtError("checksum no coincide, transferencia corrupta")
-            os.replace(tmp, full)
-        finally:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        log(f"{who}: PUT {full} ({size} bytes)")
-        send_msg(s, {"ok": True, "path": full, "size": size})
+        recv_tree(s, base, req, root=root)
+        size, n = tree_total(req), len(req["files"])
+        log(f"{who}: PUT {base} ({n} archivos, {size} bytes)")
+        send_msg(s, {"ok": True, "path": base, "size": size, "files": n})
 
     def op_push(self, s, req, who):
-        full = resolve(self.server.root, req["path"])
-        if not os.path.isfile(full):
-            raise ZtError("no es un archivo: " + req["path"])
+        root = self.server.root
+        full = resolve(root, req["path"] or ".")
         last = [0.0]
 
         def forward(done, total):
@@ -294,14 +342,9 @@ class Handler(socketserver.BaseRequestHandler):
                 send_msg(s, {"progress": done, "total": total})
 
         log(f"{who}: PUSH {full} -> {req['host']}:{req['dest']}")
-        r = client_push_put(req["host"], req["port"], self.server.token,
-                            full, req["dest"], forward)
+        r = client_put(req["host"], req["port"], self.server.token,
+                       full, req["dest"], forward, root=root)
         send_msg(s, r)
-
-
-def client_push_put(host, port, token, local, remote, cb):
-    r = client_put(host, port, token, local, remote, cb)
-    return {"ok": True, "path": r["path"], "size": r["size"]}
 
 
 class Server(socketserver.ThreadingTCPServer):
@@ -331,10 +374,11 @@ def zerotier_ips():
 
 
 def cmd_serve(args, cfg):
-    root = os.path.realpath(os.path.expanduser(args.root))
+    root = os.path.realpath(os.path.expanduser(args.root or cfg.get("root") or "~"))
     if not os.path.isdir(root):
         raise ZtError("la raiz no existe: " + root)
-    binds = args.bind or zerotier_ips()
+    cfg_bind = cfg.get("bind")
+    binds = args.bind or ([cfg_bind] if isinstance(cfg_bind, str) else cfg_bind) or zerotier_ips()
     servers = []
     for ip in binds:
         srv = Server((ip, args.port), Handler)
@@ -370,17 +414,38 @@ def load_config():
 
 
 def cmd_init(args, cfg):
+    """Crea la config, o actualiza la existente con las opciones dadas."""
     path = config_path()
-    if os.path.exists(path):
-        raise ZtError(f"ya existe {path}")
+    created = not os.path.exists(path)
+    cfg = {}
+    if not created:
+        with open(path) as f:
+            cfg = json.load(f)
+    if args.token:
+        cfg["token"] = args.token
+    cfg.setdefault("token", secrets.token_hex(16))
+    cfg.setdefault("port", DEFAULT_PORT)
+    nodes = cfg.setdefault("nodes", {})
+    if args.port:
+        cfg["port"] = args.port
+    if args.root:
+        cfg["root"] = args.root
+    if args.bind:
+        cfg["bind"] = args.bind
+    for item in args.node or []:
+        name, _, ip = item.partition("=")
+        if not name or not ip:
+            raise ZtError(f"--node espera NOMBRE=IP, recibi: {item}")
+        nodes[name] = ip
     with open(path, "w") as f:
-        json.dump({"token": secrets.token_hex(16), "port": DEFAULT_PORT,
-                   "nodes": {"ejemplo": "10.147.17.10"}}, f, indent=2)
+        json.dump(cfg, f, indent=2)
     try:
         os.chmod(path, 0o600)
     except OSError:
         pass
-    print(f"creado {path}\nCopia ESE archivo a los demas nodos (mismo token) y edita 'nodes'.")
+    print(f"{'creado' if created else 'actualizado'} {path}")
+    if created and not args.token:
+        print("Copia ESE archivo a los demas nodos (mismo token), o usa `init --token ...` en cada uno.")
 
 
 # ---------------------------------------------------------------------- cli
@@ -434,15 +499,15 @@ def cmd_cp(args, cfg):
         elif dhost is None:
             r = client_get(shost, port, token, spath, dpath, prog)
         elif shost is None:
-            if not os.path.isfile(spath):
-                raise ZtError("no es un archivo local: " + spath)
             r = client_put(dhost, port, token, spath, dpath, prog)
         else:
             r = client_push(shost, port, token, spath, dhost, port, dpath, prog)
     finally:
         prog.end()
     dt = max(time.monotonic() - t0, 1e-6)
-    print(f"ok: {r['path']} ({fmt_size(r['size'])} en {dt:.1f}s)")
+    n = r.get("files", 1)
+    extra = f", {n} archivos" if n != 1 else ""
+    print(f"ok: {r['path']} ({fmt_size(r['size'])}{extra} en {dt:.1f}s)")
 
 
 def cmd_ls(args, cfg):
@@ -455,14 +520,42 @@ def cmd_ls(args, cfg):
         print(f"  {'<dir>' if e['dir'] else fmt_size(e['size']):>9}  {e['name']}{'/' if e['dir'] else ''}")
 
 
+def cmd_complete(args, cfg):
+    """Candidatos de autocompletado para la palabra dada (uso interno)."""
+    global TIMEOUT
+    TIMEOUT = 2
+    word = args.word
+    try:
+        if ":" not in word or re.match(r"^[A-Za-z]:[\\/]", word):
+            for name in sorted(cfg["nodes"]):
+                if name.lower().startswith(word.lower()):
+                    print(name + ":")
+            return
+        alias, path = word.split(":", 1)
+        cut = max(path.rfind("/"), path.rfind("\\")) + 1
+        dirpart, prefix = path[:cut], path[cut:]
+        r = client_ls(cfg["nodes"].get(alias, alias), cfg["port"], cfg["token"], dirpart or ".")
+    except (ZtError, OSError):
+        return
+    for e in r["entries"]:
+        if e["name"].lower().startswith(prefix.lower()):
+            print(f"{alias}:{dirpart}{e['name']}{'/' if e['dir'] else ''}")
+
+
 def main():
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(prog="ztftp", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("init", help="crea ~/.ztftp.json con un token nuevo").set_defaults(fn=cmd_init)
+    p = sub.add_parser("init", help="crea o actualiza ~/.ztftp.json (token nuevo si no existe)")
+    p.add_argument("--token", help="usar este token compartido en vez de generar uno")
+    p.add_argument("--node", action="append", metavar="NOMBRE=IP", help="agrega un alias de nodo")
+    p.add_argument("--root", help="directorio raiz que expone el demonio")
+    p.add_argument("--bind", action="append", metavar="IP", help="IP de ZeroTier donde escucha el demonio")
+    p.add_argument("--port", type=int)
+    p.set_defaults(fn=cmd_init)
     p = sub.add_parser("serve", help="demonio del nodo")
-    p.add_argument("--root", default="~", help="directorio raiz expuesto (default: home)")
+    p.add_argument("--root", help="directorio raiz expuesto (default: 'root' de la config, o el home)")
     p.add_argument("--bind", action="append", help="IP donde escuchar (default: IPs de ZeroTier)")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.set_defaults(fn=cmd_serve)
@@ -475,6 +568,9 @@ def main():
     p.add_argument("destino")
     p.add_argument("--port", type=int)
     p.set_defaults(fn=cmd_ls)
+    p = sub.add_parser("_complete", help=argparse.SUPPRESS)
+    p.add_argument("word", nargs="?", default="")
+    p.set_defaults(fn=cmd_complete)
     args = ap.parse_args()
     try:
         cfg = None if args.cmd == "init" else load_config()

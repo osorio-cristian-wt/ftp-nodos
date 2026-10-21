@@ -3,3 +3,4 @@ __pycache__/
 .ztftp.json
 *.ztftp-part
 *.log
+*.egg-info/
